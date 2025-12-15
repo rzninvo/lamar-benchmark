@@ -17,6 +17,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
 import numpy as np
+try:
+    import pycolmap
+except ImportError:
+    pycolmap = None
 
 from scantools.capture import Capture, Session, Sensors, Camera, Trajectories, RecordsCamera, Pose
 from scantools.capture import create_sensor
@@ -43,19 +47,29 @@ def create_simple_query_session(capture: Capture,
     dest_image = raw_data / image_name
     shutil.copy2(query_image_path, dest_image)
 
-    # Create a simple camera (you may need to adjust these intrinsics)
-    # These are typical phone camera parameters - adjust to your camera
+    # Infer camera intrinsics from EXIF if possible, otherwise fall back to a heuristic.
     from PIL import Image
     img = Image.open(query_image_path)
     width, height = img.size
+    camera_params = None
+    if pycolmap is not None:
+        try:
+            cam = pycolmap.infer_camera_from_image(str(query_image_path))
+            camera_params = [cam.model_name, cam.width, cam.height, *cam.params.tolist()]
+            print(f"[intrinsics] pycolmap inferred {cam.model_name} {cam.width}x{cam.height} "
+                  f"params={cam.params.tolist()}")
+            width, height = cam.width, cam.height
+        except Exception as e:
+            print(f"[intrinsics] pycolmap inference failed ({e}); falling back to heuristic.")
 
-    # Rough estimate: focal length ~0.7 * max(width, height)
-    focal = 0.7 * max(width, height)
-    cx, cy = width / 2, height / 2
+    if camera_params is None:
+        focal = 0.7 * max(width, height)
+        cx, cy = width / 2, height / 2
+        camera_params = ['PINHOLE', int(width), int(height), float(focal), float(focal), float(cx), float(cy)]
+        print(f"[intrinsics] heuristic PINHOLE {width}x{height} fx=fy={focal:.2f} cx={cx:.2f} cy={cy:.2f}")
 
     sensors = Sensors()
-    camera = create_sensor('camera', ['PINHOLE', width, height, focal, focal, cx, cy],
-                          name='Phone camera')
+    camera = create_sensor('camera', camera_params, name='Phone camera')
     sensors['camera'] = camera
 
     # Create image records
@@ -107,6 +121,21 @@ def localize_image(map_path: Path,
         import shutil
         print(f"Removing existing query session: {query_session_dir}")
         shutil.rmtree(query_session_dir)
+
+    # Also clean up cached features for the query session
+    # Clear cached artifacts for the query session so a new image is processed.
+    # Task outputs live under extraction/matching/... (not feature_extraction/feature_matching).
+    query_cache_dirs = [
+        output_dir / "extraction" / "query_single",
+        output_dir / "matching" / "query_single",
+        output_dir / "pair_selection" / "query_single",
+        output_dir / "pose_estimation" / "query_single",
+    ]
+    for cache_dir in query_cache_dirs:
+        if cache_dir.exists():
+            import shutil
+            print(f"Removing cached query data: {cache_dir}")
+            shutil.rmtree(cache_dir)
 
     # Load capture
     capture = Capture.load(capture_dir)
@@ -190,7 +219,7 @@ def localize_image(map_path: Path,
     # Show matched candidate images
     pairs_file = pairs_loc.paths.pairs_hloc
     if pairs_file.exists():
-        print(f"\n📸 Candidate map images matched against query:")
+        print(f"\n Candidate map images matched against query:")
         with open(pairs_file, 'r') as f:
             pairs = [line.strip().split() for line in f.readlines()]
             print(f"  Found {len(pairs)} candidate images:")
@@ -243,4 +272,3 @@ if __name__ == '__main__':
 
     # Run localization
     localize_image(args.map_path, args.query_image, args.output_dir)
-
